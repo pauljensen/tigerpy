@@ -6,7 +6,7 @@ import numpy as np
 
 import cobra
 import cobra.test
-import parsing
+from . import parsing
 
 
 class TigerModel(object):
@@ -18,11 +18,11 @@ class TigerModel(object):
         self.lb = self.fields['lb']
         self.ub = self.fields['ub']
         self.genes = self.fields['genes']
-        
+
         grRules = self.fields['grRules']
         self.gprs = list(map(parsing.parse_boolean_string, grRules))
         self.rules = list(map(lambda x: x.to_rule(), self.gprs))
-    
+
     @classmethod
     def from_cobra(cls, cb):
         fields = cobra.io.mat.create_mat_dict(cb)
