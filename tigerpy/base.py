@@ -1,220 +1,133 @@
 
+import copy
+import collections
 
+import numpy as np
 import gurobi as gp
 from gurobi import GRB
 
-import numpy as np
-
-from . import utils
-
-def get_bounds(x):
-    return np.copy(x.lb), np.copy(x.ub)
-
-def reset_bounds(x, old_bounds):
-    x.lb = np.copy(old_bounds[0])
-    x.ub = np.copy(old_bounds[1])
+import cobra
+import cobra.test
+from . import parsing
 
 
-def make_base_model(tiger):
-    model = gp.Model()
-    n = tiger.S.shape[1]
-    v = model.addMVar(shape=n, lb=tiger.lb, ub=tiger.ub, name="v")
-    model.setObjective(tiger.c @ v, GRB.MAXIMIZE)
-    model.addConstr(tiger.S @ v == tiger.b, name="Sv=b")
-    model.update()
-    return model, v
+def get_vars_by_name(model, names, container="list"):
+    v = [model.getVarByName(name) for name in names]
+    if container.lower() == "list":
+        return v
+    elif container.lower() == "dict":
+        return dict(zip(names, v))
+    elif container.lower() == "mvar":
+        return gp.MVar(v)
 
 
-def add_objective_constraint(model, frac=1.0):
-    model.optimize()
-    objval = model.ObjVal
-    print(model.ModelSense)
-    if model.ModelSense == GRB.MAXIMIZE:
-        model.addConstr(model.getObjective() >= frac*objval)
-    else:
-        model.addConstr(model.getObjective() <= frac*objval)
-    model.update()
+class TigerModel(object):
+    def __init__(self, fields):
+        self.fields = copy.deepcopy(fields)
+        self.c = self.fields['c']
+        self.S = self.fields['S']
+        self.b = self.fields['b']
+        self.lb = self.fields['lb']
+        self.ub = self.fields['ub']
+        self.genes = list(self.fields['genes'])
+        self.rxns = list(self.fields['rxns'])
 
+        grRules = self.fields['grRules']
+        self.gprs = list(map(parsing.parse_boolean_string, grRules))
+        self.rules = list(map(lambda x: x.to_rule(), self.gprs))
 
-def fba(tiger):
-    m, v = make_base_model(tiger)
-    m.optimize()
-    return m, v
+    @classmethod
+    def from_cobra(cls, cb):
+        fields = cobra.io.mat.create_mat_dict(cb)
+        return TigerModel(fields)
 
-
-def fva(tiger, fraction=None):
-    m, v = make_base_model(tiger)
-    m.Params.OutputFlag = 0
-
-    # TODO: add fraction support
-
-    n = v.shape[0]
-    minflux = np.ndarray(n)
-    maxflux = np.ndarray(n)
-
-    for i in range(n):
-        m.setObjective(v[i] + 0, GRB.MAXIMIZE)
-        m.optimize()
-        maxflux[i] = v[i].X
-
-    for i in range(n):
-        m.setObjective(v[i] + 0, GRB.MINIMIZE)
-        m.optimize()
-        minflux[i] = v[i].X
-
-    return minflux, maxflux
-
-
-def single_gene_ko(tiger):
-    genes = utils.unique(utils.flatten([x.atoms() for x in tiger.gprs]))
-    n = len(genes)
-
-    m, v = make_base_model(tiger)
-    m.Params.OutputFlag = 0
-    m.optimize()
-    wt_rate = m.ObjVal
-    old = get_bounds(v)
-
-    ko_rate = np.ndarray(n)
-    for i in range(n):
-        to_remove = np.logical_not(tiger.eval_gprs({genes[i]: False}))
-        v[to_remove].lb = 0
-        v[to_remove].ub = 0
-        m.optimize()
-        ko_rate[i] = m.ObjVal
-        reset_bounds(v, old)
-
-    return ko_rate / wt_rate
-
-
-def simple_flux_coupling(tiger, idxs=None, fixed_tol=1e-5):
-    isfixed = lambda x,y: np.all(np.isclose(x, y, atol=fixed_tol))
-
-    m, v = make_base_model(tiger)
-    m.Params.OutputFlag = 0
-    if idxs is not None:
-        v = v[idxs]
-    n = v.shape[0]
-
-    coupled = np.zeros((n,n), dtype=bool)
-    active = np.ones((n,), dtype=bool)
-
-    old = get_bounds(v)
-    lps = 0
-
-    for i in range(n):
-        if not active[i]:
-            continue
-
-        coupled[i,i] = True
-        m.setObjective(1.0*v[i], sense=GRB.MAXIMIZE)
-        m.optimize()
-
-        v[i].lb = v[i].X
-        v[i].ub = v[i].X
-
-        for j in range(i+1, n):
-            if not active[j]:
-                continue
-
-            m.setObjective(1.0*v[j], sense=GRB.MAXIMIZE)
-            m.optimize()
-            lps += 1
-            vmax = v[j].X
-
-            m.setObjective(1.0*v[j], sense=GRB.MINIMIZE)
-            m.optimize()
-            lps += 1
-            vmin = v[j].X
-
-            if isfixed(vmax, vmin):
-                coupled[i,j] = True
-                active[j] = False
-
-        reset_bounds(v, old)
-        active[i] = False
-        print("Var = ", i, "LPs = ", lps)
-
-    return coupled
-
-
-
-def flux_coupling(tiger, idxs=None, fixed_tol=1e-5):
-    isfixed = lambda x,y: np.all(np.isclose(x, y, atol=fixed_tol))
-
-    m, v = make_base_model(tiger)
-    m.Params.OutputFlag = 0
-    if idxs is not None:
-        v = v[idxs]
-    n = v.shape[0]
-
-    coupled = np.zeros((n,n), dtype=bool)
-    active = np.ones((n,), dtype=bool)
-
-    global_max = np.full((n,), -np.inf)
-    global_min = np.full((n,), np.inf)
-
-    #blocked = np.zeros(n, dtype=bool)
-    #blocked_known = np.zeros(n, dtype=bool)
-
-    old = get_bounds(v)
-    lps = 0
-
-    for i in range(n):
-        if not active[i]:
-            continue
-        local_max = np.full((n,), -np.inf)
-        local_min = np.full((n,), np.inf)
-
-        coupled[i,i] = True
-        m.setObjective(1.0*v[i], sense=GRB.MAXIMIZE)
-        m.optimize()
-
-        v[i].lb = v[i].X
-        v[i].ub = v[i].X
-        local_max = np.maximum(local_max, v.X)
-        local_min = np.minimum(local_min, v.X)
-        global_max = np.maximum(global_max, v.X)
-        global_min = np.minimum(global_min, v.X)
-
-        for j in range(i+1, n):
-            if not active[j]:
-                continue
-            if not isfixed(local_max[j], local_min[j]):
-                continue
-            dist_ub = np.abs(v.ub[j] - local_max[j])
-            dist_lb = np.abs(v.lb[j] - local_min[j])
-            if dist_ub > dist_lb:
-                sense = GRB.MAXIMIZE
+    def eval_gprs(self, gene_dict, default=True):
+        x = collections.defaultdict(lambda: default, gene_dict)
+        n = self.S.shape[1]
+        rxn_states = np.ndarray(n, dtype=bool)
+        for i in range(n):
+            if self.rules[i]:
+                rxn_states[i] = eval(self.rules[i])
             else:
-                sense = GRB.MINIMIZE
-            m.setObjective(1.0*v[j], sense=sense)
-            m.optimize()
-            lps += 1
-            local_max = np.maximum(local_max, v.X)
-            local_min = np.minimum(local_min, v.X)
-            global_max = np.maximum(global_max, v.X)
-            global_min = np.minimum(global_min, v.X)
+                rxn_states[i] = True
+        return rxn_states
+    
+    def get_exchange_rxns(self, names=False):
+        idxs = (self.S != 0).sum(0) == 1
+        if names:
+            return self.rxns[idxs]
+        else:
+            return idxs
+    
+    def make_base_model(self, add_gpr=True, genes="continuous", bounds="weak", **kwargs):
+        model = gp.Model()
+        n = self.S.shape[1]
+        for i in range(n):
+            model.addVar(lb=self.lb[i], ub=self.ub[i], name=self.rxns[i])
+        model.update()
+        
+        v = get_vars_by_name(model, self.rxns, "MVar")
+        model.setObjective(self.c @ v, GRB.MAXIMIZE)
+        model.addConstr(self.S @ v == self.b, name="Sv=b")
+        model.update()
+        
+        if add_gpr:
+            if genes == "continuous" and bounds == "weak":
+                add_gprs_cnf_weak_(self, model, **kwargs)
+            # elif genes == "continuous" and bounds == "strong":
+            #     # FALCON
+            # elif genes == "discrete" and bounds == "weak":
+            #     # CNF with binary variables
+            # elif genes == "discrete" and bounds == "strong":
+            #     # SR-FBA
+                
+            g = get_vars_by_name(model, self.genes, "MVar")
+        else:
+            g = None
+            
+        return model, v, g
 
-            if not isfixed(local_max[j], local_min[j]):
-                continue
-            m.setObjective(1.0*v[j], sense=-sense)
-            m.optimize()
-            lps += 1
-            local_max = np.maximum(local_max, v.X)
-            local_min = np.minimum(local_min, v.X)
-            global_max = np.maximum(global_max, v.X)
-            global_min = np.minimum(global_min, v.X)
 
-            if isfixed(local_max[j], local_min[j]):
-                coupled[i,j] = True
-                active[j] = False
+def add_gprs_cnf_weak_(tiger, model, gene_ub=None, gpr_suffix="__GPR", **kwargs):
+    rxns = get_vars_by_name(model, tiger.rxns)
+    
+    if gene_ub is None:
+        ub = GRB.INFINITY
+    else:
+        ub = gene_ub
+    for gene in tiger.genes:
+        model.addVar(lb=0.0, ub=ub, name=gene)
+    model.update()
+    g = get_vars_by_name(model, tiger.genes, "dict")
+    
+    for v, gpr in zip(rxns, tiger.gprs):
+        if gpr.is_empty():
+            continue
+        
+        cnfs = parsing.make_cnf(gpr, names_only=True)
+        for i, cnf in enumerate(cnfs):
+            genes = [g[name] for name in cnf]
+            if gene_ub is None:
+                model.addConstr(
+                    v <= gp.quicksum(genes),
+                    name = v.varname + gpr_suffix + '-UB[' + str(i) + ']')
+                model.addConstr(
+                    v >= gp.quicksum(genes),
+                    name = v.varname + gpr_suffix + '-LB[' + str(i) + ']')
+            else:
+                model.addConstr(
+                    v <= v.ub/ub * gp.quicksum(genes),
+                    name = v.varname + gpr_suffix + '-UB[' + str(i) + ']')
+                model.addConstr(
+                    v >= v.lb/ub * gp.quicksum(genes),
+                    name = v.varname + gpr_suffix + '-LB[' + str(i) + ']')
+    
+    model.update()
 
-        reset_bounds(v, old)
-        active[i] = False
-        print("Var = ", i, "LPs = ", lps)
 
-    blocked = np.abs(global_max - global_min) <= fixed_tol
-    coupled[:,blocked] = False
-    print(sum(blocked))
-    return coupled
+
+if __name__ == '__main__':
+    cb = cobra.test.create_test_model('textbook')
+    tiger = TigerModel.from_cobra(cb)
+    print(tiger.gprs[0].operands)
+    print(tiger.rules)

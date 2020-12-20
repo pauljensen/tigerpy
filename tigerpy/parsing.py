@@ -2,7 +2,8 @@
 import pyparsing as pp
 
 class Expression(object):
-    pass
+    def is_empty(self):
+        return False
 
 
 class Atom(Expression):
@@ -50,6 +51,9 @@ class Empty(Expression):
     
     def has(self, op):
         return False
+    
+    def is_empty(self):
+        return True
     
     __repr__ = __str__
     
