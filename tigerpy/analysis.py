@@ -7,6 +7,95 @@ import numpy as np
 
 from . import utils
 
+
+def add_objective_constraint_(model, frac=1.0, absolute=None, solved=False):
+    if frac is None and absolute is None:
+        raise ValueError('Either `frac` or `absolute` required.')
+    
+    if absolute is not None:
+        cutoff = absolute
+    else:
+        if not solved:
+            model.optimize()
+        cutoff = frac * model.ObjVal
+    
+    if model.ModelSense == GRB.MAXIMIZE:
+        constr = model.addConstr(model.getObjective() >= cutoff)
+    else:
+        constr = model.addConstr(model.getObjective() <= cutoff)
+    model.update()
+    return constr
+
+
+def get_obj(model):
+    return model.getObjective(), model.ModelSense
+
+
+def set_obj_(model, obj):
+    model.setObjective(obj[0], obj[1])
+    
+
+def pFBA(model, x, norm="l1", solved=False):
+    L1 = norm.lower() == "l1"
+    L2 = norm.lower() == "l2"
+    
+    if not solved:
+        model.optimize()
+    objval = model.ObjVal
+        
+    obj_constr = add_objective_constraint_(model, solved=True)
+    orig_obj = get_obj(model)
+    
+    if L1:
+        # WARNING: this assumes x >= 0
+        model.setObjective(x.sum(), GRB.MINIMIZE)
+    elif L2:
+        model.setObjective(x @ x, GRB.MINIMIZE)
+    
+    model.optimize()
+    X = np.copy(x.X)
+    
+    set_obj_(model, orig_obj)
+    model.remove(obj_constr)
+    model.update()
+    
+    return X, objval
+
+
+def pFBA_sensitivity(model, x, delta=0.1, norm="l1", obj_tol=1e-6):
+    center_X, center_obj = pFBA(model, x, norm)
+    
+    ub = np.copy(x.ub)
+    
+    x.ub = (1+delta) * ub
+    upper_X, upper_obj = pFBA(model, x, norm)
+    
+    if center_obj > obj_tol:
+        x.ub = (1-delta) * ub
+        lower_X, lower_obj = pFBA(model, x, norm)
+    else:
+        lower_X = np.zeros(upper_X.shape)
+        lower_obj = center_obj
+    
+    x.ub = ub
+    
+    grad = np.zeros(center_X.shape)
+    if abs(upper_obj - center_obj) > obj_tol:
+        grad = (upper_X - center_X) / (upper_obj - center_obj)
+        
+    if abs(center_obj - lower_obj) > obj_tol:
+        lower = (center_X - lower_X) / (center_obj - lower_obj)
+        grad = np.where(np.abs(grad) > np.abs(lower), grad, lower)
+        
+    nonzero = np.abs(grad) > obj_tol
+    grad[nonzero] = 1 / grad[nonzero]
+        
+    return grad, [lower_obj, center_obj, upper_obj]
+    
+    
+
+# ================ Previous functions for TIGER models ================
+
 def get_bounds(x):
     return np.copy(x.lb), np.copy(x.ub)
 

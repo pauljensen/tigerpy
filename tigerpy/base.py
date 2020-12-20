@@ -112,7 +112,7 @@ def add_gprs_cnf_weak_(tiger, model, gene_ub=None, gpr_suffix="__GPR", **kwargs)
                     v <= gp.quicksum(genes),
                     name = v.varname + gpr_suffix + '-UB[' + str(i) + ']')
                 model.addConstr(
-                    v >= gp.quicksum(genes),
+                    v >= -gp.quicksum(genes),
                     name = v.varname + gpr_suffix + '-LB[' + str(i) + ']')
             else:
                 model.addConstr(

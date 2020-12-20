@@ -28,6 +28,10 @@ smu.lb[smu.lb > 0] = 0
 #simple = base.simple_flux_coupling(smu, idxs)
 #coupled = base.flux_coupling(smu)
 
-model, v, g = smu.make_base_model()
+model, v, g = smu.make_base_model(add_gpr=True)
 
-    
+g_p, _ = tiger.pFBA(model, g, norm="l2")
+g.ub = g_p
+model.update()
+
+grad, objs = tiger.pFBA_sensitivity(model, g)
